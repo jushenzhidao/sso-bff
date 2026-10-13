@@ -344,7 +344,10 @@ jobs:
               echo "**Full changelog**: ${REPO_URL}/compare/${PREV}...${TAG}"
               echo
             fi
-            git log "$RANGE" --no-merges --max-count=50 --pretty='- %s (%h)'
+            # --invert-grep 排掉版本写回提交自身（chore(release): vX.Y.Z），
+            # 否则每次发版 notes 里都会混进一条「为发版而提交」的噪音条目。
+            git log "$RANGE" --no-merges --max-count=50 --pretty='- %s (%h)' \
+              --invert-grep --grep='^chore(release):'
             echo
             echo "### 容器镜像"
             echo
