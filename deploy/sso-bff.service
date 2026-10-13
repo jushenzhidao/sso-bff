@@ -1,0 +1,26 @@
+# sso-bff systemd 单元（生产部署模板）
+# 放置：/etc/systemd/system/sso-bff.service
+# 注意：EnvironmentFile 指向真实 .env（0600，含全部机密）
+
+[Unit]
+Description=sso-bff 多应用统一认证与计费打通 BFF 身份服务
+After=network.target redis.service
+
+[Service]
+Type=simple
+User=www
+Group=www
+WorkingDirectory=/opt/sso-bff
+EnvironmentFile=/opt/sso-bff/.env
+ExecStart=/opt/sso-bff/venv/bin/uvicorn sso_bff.main:app --host 127.0.0.1 --port 8800 --workers 2
+Restart=always
+RestartSec=3
+# 安全加固
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/sso-bff
+
+[Install]
+WantedBy=multi-user.target

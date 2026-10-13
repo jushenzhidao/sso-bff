@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.env
+.dev_fernet_key
+sso_bff.db
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# agent 工作区数据（含内网路径与运维笔记，不入版本库）
+.workbuddy/

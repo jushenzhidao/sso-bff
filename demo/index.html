@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sso-bff 演示 · 统一登录与计费打通</title>
+<style>
+  :root { --bd:#d0d7de; --fg:#1f2328; --mut:#59636e; --acc:#0969da; --ok:#1a7f37; --err:#cf222e; }
+  * { box-sizing:border-box }
+  body { font-family:system-ui,-apple-system,"PingFang SC",sans-serif; color:var(--fg);
+         max-width:760px; margin:0 auto; padding:32px 16px; background:#fff }
+  h1 { font-size:22px } h2 { font-size:16px; margin-top:28px }
+  .card { border:1px solid var(--bd); border-radius:10px; padding:16px; margin:12px 0 }
+  button { padding:8px 14px; border-radius:6px; border:1px solid var(--bd); background:#f6f8fa;
+           cursor:pointer; font-size:14px; margin-right:8px }
+  button.primary { background:var(--acc); color:#fff; border-color:var(--acc) }
+  button:hover { filter:brightness(.97) }
+  code,pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px }
+  pre { background:#f6f8f8; border:1px solid var(--bd); border-radius:8px; padding:10px; overflow:auto }
+  .mut { color:var(--mut); font-size:13px }
+  .ok { color:var(--ok) } .err { color:var(--err) }
+  #keybox { word-break:break-all }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap }
+</style>
+</head>
+<body>
+<h1>sso-bff 演示应用</h1>
+<p class="mut">对应 PRD：F3.1 登录接入 · F3.2 钥匙使用（key 仅存页面内存，禁写 localStorage/Cookie）</p>
+
+<div id="logged-out">
+  <div class="card">
+    <p>未登录。点击下面的按钮跳转 BFF 登录端点（将经 mock IdP / Casdoor 完成认证）。</p>
+    <button class="primary" onclick="login()">登录（跳转 /auth/login）</button>
+  </div>
+</div>
+
+<div id="logged-in" hidden>
+  <div class="card">
+    <div class="row">
+      <strong id="me-name">…</strong>
+      <span class="mut" id="me-phone"></span>
+      <button onclick="logout()">登出</button>
+    </div>
+  </div>
+
+  <h2>① 取钥匙（GET /api/credential）</h2>
+  <div class="card">
+    <button class="primary" onclick="fetchKey()">获取本人 key</button>
+    <button onclick="rotateKey()">轮换 key</button>
+    <p class="mut" id="key-state">key 尚未获取</p>
+    <pre id="keybox"></pre>
+  </div>
+
+  <h2>② 直连 new-api（Bearer key → /v1/models，免费端点）</h2>
+  <div class="card">
+    <button onclick="callModels()" id="btn-models">调用 new-api /v1/models</button>
+    <span class="mut">请求头 Authorization: Bearer &lt;内存中的 key&gt;；计费按 key 归属到本人账户。</span>
+    <pre id="models-out">尚未调用</pre>
+  </div>
+
+  <h2>③ 控制台入口（SSO 免登，绑定后落到同一账户）</h2>
+  <div class="card">
+    <button onclick="connectConsole()">连接 new-api 控制台（绑定 oidc_id）</button>
+    <span class="mut" id="cc-state">未连接</span>
+    <p class="mut" style="margin-top:8px">
+      首次使用需点上方按钮完成一次性绑定（经 Casdoor SSO 静默跳转）。
+      之后 <a href="https://newapi-0to1.livetest.cn/console" target="_blank" rel="noopener">进入控制台</a>
+      将落到与 API 调用相同的账户：用量、余额、日志完全一致（AC-06）。
+    </p>
+  </div>
+</div>
+
+<script>
+// ============ 纪律：key 只存在于本变量，禁写 localStorage/sessionStorage/Cookie ============
+let userKey = null;           // 唯一存放处：页面内存
+let keyExpired = -1;
+let modelsRetryTimer = null;  // 401 重试防抖（F3.2）
+
+const BFF = '';                同源（BFF 托管本页）
+const NEWAPI = 'https://newapi-0to1.livetest.cn';
+
+async function api(path, opts = {}) {
+  const resp = await fetch(BFF + path, { credentials: 'include', ...opts });
+  if (resp.status === 401) { showLoggedOut(); throw new Error('unauthenticated'); }
+  return resp;
+}
+
+function showLoggedIn() { document.getElementById('logged-out').hidden = true;
+  document.getElementById('logged-in').hidden = false; }
+function showLoggedOut() { document.getElementById('logged-out').hidden = false;
+  document.getElementById('logged-in').hidden = true; userKey = null; }
+
+function login() {
+  const back = location.pathname + location.search;
+  location.href = '/auth/login?redirect=' + encodeURIComponent(back);
+}
+async function logout() { await api('/auth/logout', { method: 'POST' }); showLoggedOut(); }
+
+async function fetchKey() {
+  const resp = await api('/api/credential');
+  const d = await resp.json();
+  if (!resp.ok) { document.getElementById('key-state').textContent = '取钥匙失败：' + d.detail;
+    document.getElementById('key-state').className = 'err'; return; }
+  userKey = d.key; keyExpired = d.expired_time;
+  document.getElementById('key-state').textContent =
+    'key 已存入页面内存（masked: ' + d.key_masked + '，token_id=' + d.token_id + '）';
+  document.getElementById('key-state').className = 'ok';
+  document.getElementById('keybox').textContent =
+    'new_api_user_id=' + d.new_api_user_id + '  token_id=' + d.token_id +
+    '  expired_time=' + d.expired_time + '\nkey = ' + d.key_masked + '（明文仅在内存）';
+}
+
+async function rotateKey() {
+  const resp = await api('/api/credential/rotate', { method: 'POST' });
+  const d = await resp.json();
+  if (!resp.ok) { alert('轮换失败：' + d.detail); return; }
+  userKey = d.key;
+  document.getElementById('key-state').textContent = '已轮换（masked: ' + d.key_masked + '）';
+  document.getElementById('keybox').textContent = '新 key = ' + d.key_masked + '（明文仅在内存）';
+}
+
+async function callModels() {
+  const out = document.getElementById('models-out');
+  if (!userKey) { out.textContent = '请先取钥匙'; out.className = 'err'; return; }
+  out.textContent = '请求中…';
+  try {
+    const resp = await fetch(NEWAPI + '/v1/models', {
+      headers: { 'Authorization': 'Bearer ' + userKey },
+    });
+    const text = await resp.text();
+    out.textContent = 'HTTP ' + resp.status + '\n' + text.slice(0, 600);
+    out.className = resp.ok ? 'ok' : 'err';
+    if (resp.status === 401 && !modelsRetryTimer) {
+      // key 失效：防抖重试——先重新取钥匙，再重放一次（F3.2）
+      modelsRetryTimer = setTimeout(async () => {
+        modelsRetryTimer = null;
+        out.textContent += '\n[key 失效，自动重新取钥匙并重试一次]';
+        await fetchKey();
+        if (userKey) await callModels();
+      }, 1500);
+    }
+  } catch (e) {
+    out.textContent = '直连失败（可能是 CORS/网络）：' + e.message +
+      '\n生产环境需在 new-api 前置 nginx 放行本应用来源（PRD 安全风险表）。';
+    out.className = 'err';
+  }
+}
+
+async function connectConsole() {
+  const st = document.getElementById('cc-state');
+  st.textContent = '检查绑定状态…'; st.className = 'mut';
+  try {
+    let resp = await api('/api/console-connect/status');
+    let d = await resp.json();
+    if (d.bound) {
+      st.textContent = '已绑定到同一账户（oidc_id 前缀 ' + d.oidc_id_prefix + '）';
+      st.className = 'ok'; return;
+    }
+    st.textContent = '发起绑定…（将跳 Casdoor 静默授权）';
+    resp = await api('/api/console-connect/start', { method: 'POST' });
+    d = await resp.json();
+    if (!resp.ok) { st.textContent = '发起失败：' + (d.detail || resp.status); st.className = 'err'; return; }
+    location.href = d.authorize_url;
+  } catch (e) { st.textContent = '错误：' + e.message; st.className = 'err'; }
+}
+
+// 引导：探测登录态
+(async function init() {
+  const params = new URLSearchParams(location.search);
+  if (params.get('error') === 'jit_failed') {
+    alert('登录成功，但开户尚未完成（new-api 侧异常）。进入页面后将自动补登，请稍后重试取钥匙。');
+  }
+  try {
+    const resp = await api('/api/me');
+    if (resp.ok) {
+      const d = await resp.json();
+      document.getElementById('me-name').textContent = d.name || d.sub;
+      document.getElementById('me-phone').textContent = d.phone_masked || '';
+      showLoggedIn();
+      // 顺带刷新绑定状态
+      const cc = await api('/api/console-connect/status');
+      if (cc.ok && (await cc.json()).bound) {
+        const st = document.getElementById('cc-state');
+        st.textContent = '已绑定到同一账户'; st.className = 'ok';
+      }
+    } else { showLoggedOut(); }
+  } catch { showLoggedOut(); }
+})();
+</script>
+</body>
+</html>

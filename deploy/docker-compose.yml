@@ -1,0 +1,30 @@
+# sso-bff 一体化 compose（开发/小型部署）
+# 生产建议：BFF 用 systemd 常驻 + MySQL/Redis 独立部署；本文件仅作参考。
+services:
+  sso-bff:
+    build: ..
+    ports:
+      - "127.0.0.1:8800:8800"
+    env_file: .env
+    depends_on:
+      - redis
+      - mysql
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+
+  mysql:
+    image: mysql:8.2
+    environment:
+      MYSQL_ROOT_PASSWORD: ${SSO_BFF_MYSQL_ROOT_PASSWORD:?}
+      MYSQL_DATABASE: sso_bff
+      MYSQL_USER: sso_bff
+      MYSQL_PASSWORD: ${SSO_BFF_MYSQL_PASSWORD:?}
+    volumes:
+      - mysql-data:/var/lib/mysql
+    restart: unless-stopped
+
+volumes:
+  mysql-data:
