@@ -20,7 +20,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from . import console_connect as console_connect_mod
+from . import __version__, console_connect as console_connect_mod
 from .config import settings
 from .console_connect import ConsoleConnectError
 from .crypto import mask_key
@@ -60,7 +60,7 @@ async def lifespan(app: FastAPI):
     await close_db()
 
 
-app = FastAPI(title="sso-bff", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="sso-bff", version=__version__, lifespan=lifespan)
 
 if settings.demo_origins:
     app.add_middleware(

@@ -1,0 +1,404 @@
+name: release
+
+# 混合发版模型（push main 自增 patch + 人工 tag 作新基线 + dispatch 补发）：
+#   ① push main        -> 自增 patch（基线 = 最新版本 tag）
+#   ② push tag v*.*.*  -> 以该 tag 发版，不递增（minor/major 由人工决定）
+#   ③ workflow_dispatch-> 给已存在的 tag 补发
+#
+# 逃生阀：commit message 里出现 [skip release] 则只跑测试，不出镜像、不发 Release。
+#
+# 产物：ghcr.io/jushenzhidao/sso-bff 的 <version> / latest / sha-<7位> 三个 tag
+#       （同一次 build，digest 必须一致）+ GitHub Release。
+#
+# 版本号的唯一真相是 git tag；本 workflow 会把版本写回 sso_bff/__init__.py 并提交，
+# 因为该常量同时决定镜像内自报版本（OpenAPI info.version）——不写回就会漂移。
+on:
+  push:
+    branches: [main]
+    tags: ['v[0-9]*.[0-9]*.[0-9]*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的 tag（必须已存在，例如 v1.0.2）'
+        required: true
+        type: string
+
+permissions:
+  contents: write    # 打 tag / 建 Release
+  packages: write    # 推 GHCR
+
+# 静态分组：让 tag 模式与 auto 模式串行，避免两个 run 竞争同一个版本号。
+# 刻意不 cancel-in-progress —— 半途取消会留下「镜像推了、tag 没打」的中间态。
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/jushenzhidao/sso-bff
+
+jobs:
+  # ------------------------------------------------------------------
+  # 解析模式与目标版本；auto 模式下顺带把版本写回代码并提交
+  # ------------------------------------------------------------------
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      mode: ${{ steps.ver.outputs.mode }}
+      version: ${{ steps.ver.outputs.version }}
+      tag: ${{ steps.ver.outputs.tag }}
+      # 下游一律消费这个 commit，不再各自解析 ref
+      commit: ${{ steps.bump.outputs.sha || steps.ver.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # 三个入口必须取不同的 ref：
+          #   补发    -> inputs.tag
+          #   tag 推送 -> github.ref（不可变）
+          #   push main-> github.sha（github.ref 是分支指针，会在后续 push 时移动，
+          #              而本 job 要等数分钟才跑到打 tag，用 ref 会把 tag 打在错误的提交上）
+          ref: ${{ inputs.tag || (startsWith(github.ref, 'refs/tags/') && github.ref || github.sha) }}
+          fetch-depth: 0    # 浅克隆拿不到历史 tag，版本号会永远从 v0.0.0 起算
+          fetch-tags: true
+
+      - name: 配置 git 身份
+        # runner 上没有全局 git 配置；打 annotated tag 与提交都需要 committer 身份
+        run: |
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+      - name: 判定模式与目标版本
+        id: ver
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+          MSG: ${{ github.event.head_commit.message || '' }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+
+          # 逃生阀：匹配整条 message（含正文），不只匹配标题。
+          # 注意：描述这个开关的 commit message 自己也会命中，此时用
+          # workflow_dispatch 补跑（该路径 head_commit 为 null，|| '' 兜底后不误判）。
+          if printf '%s' "$MSG" | grep -qF '[skip release]'; then
+            echo "mode=skip"   >> "$GITHUB_OUTPUT"
+            echo "commit=$SHA" >> "$GITHUB_OUTPUT"
+            echo "::notice::commit message 含 [skip release] —— 跳过镜像与 Release"
+            exit 0
+          fi
+
+          # 版本写回提交由 GITHUB_TOKEN 推送，本来就不会触发 workflow；
+          # 这层只是兜底 —— 将来若改用 PAT 推送就用得上。
+          if [ "$ACTOR" = 'github-actions[bot]' ]; then
+            echo "mode=skip"   >> "$GITHUB_OUTPUT"
+            echo "commit=$SHA" >> "$GITHUB_OUTPUT"
+            echo "::notice::由 github-actions[bot] 触发 —— 跳过"
+            exit 0
+          fi
+
+          if [ -n "$INPUT_TAG" ]; then
+            MODE=tag; TAG="$INPUT_TAG"
+          elif [ "${REF#refs/tags/}" != "$REF" ]; then
+            MODE=tag; TAG="${REF#refs/tags/}"
+          else
+            MODE=auto
+          fi
+
+          if [ "$MODE" = auto ]; then
+            # 用 --sort=-v:refname 而非 git describe：后者取「最近可达的 tag」，
+            # 有合并历史时会挑错版本；且字典序会把 v1.9.0 判为新于 v1.10.0。
+            # glob 顺带排除 latest 这类滚动指针。
+            PREV="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)"
+            PREV="${PREV:-v0.0.0}"          # 零 tag 仓库的冷启动回落
+            CORE="${PREV#v}"
+            MAJOR="${CORE%%.*}"; REST="${CORE#*.}"
+            MINOR="${REST%%.*}"; PATCH="${REST#*.}"
+            PATCH="${PATCH%%[-+]*}"          # 预发布后缀会打断 $(( )) 算术，先剥掉
+            NEW="v${MAJOR}.${MINOR}.$((PATCH + 1))"
+            echo "auto: ${PREV} -> ${NEW}"
+          else
+            NEW="$TAG"
+            echo "tag:  ${NEW}"
+          fi
+
+          echo "mode=$MODE"       >> "$GITHUB_OUTPUT"
+          echo "tag=$NEW"         >> "$GITHUB_OUTPUT"
+          echo "version=${NEW#v}" >> "$GITHUB_OUTPUT"
+          echo "commit=$SHA"      >> "$GITHUB_OUTPUT"
+
+      - name: 写回版本号并提交（仅 auto）
+        id: bump
+        if: steps.ver.outputs.mode == 'auto'
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          python3 scripts/bump_version.py "$VERSION"
+
+          if git diff --quiet; then
+            # 幂等：连续 push 时代码里可能已是目标版本，此时不是故障
+            echo "代码版本已是 $VERSION —— 无需提交"
+            echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git add sso_bff/__init__.py
+          # message 里带 [skip release]：将来若改用 PAT 推送，这个提交也不会自激发版
+          git commit -m "chore(release): v${VERSION} [skip release]"
+          # 按 sha 检出是 detached HEAD，本地没有 main 分支，只能推 HEAD:main
+          git push origin HEAD:main
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  # ------------------------------------------------------------------
+  # 离线单元测试（逃生阀下也照跑：跳过发版不等于跳过验证）
+  # ------------------------------------------------------------------
+  test:
+    needs: resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+          cache: pip
+
+      - name: 安装依赖
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+
+      - name: 跑测试
+        run: python -m pytest -q
+
+  # ------------------------------------------------------------------
+  # 构建镜像 -> 冒烟 -> 推送 GHCR（冒烟不过就永不推出去）
+  # ------------------------------------------------------------------
+  build-and-push:
+    needs: [resolve, test]
+    if: needs.resolve.outputs.mode != 'skip'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: 构建镜像（先不推送）
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          MODE: ${{ needs.resolve.outputs.mode }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          SHA="$(git rev-parse --short=7 HEAD)"
+          echo "SHA=${SHA}" >> "$GITHUB_ENV"
+
+          # :latest 只在发布「最新版本」时推进。否则补发一个旧 tag 会把 latest
+          # 拖回旧镜像 —— 静默且下游无感，必须挡住。auto 模式恒为最新，直接放行。
+          if [ "$MODE" = auto ]; then
+            echo "PUSH_LATEST=1" >> "$GITHUB_ENV"
+          else
+            NEWEST="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)"
+            if [ "$TAG" = "$NEWEST" ]; then
+              echo "PUSH_LATEST=1" >> "$GITHUB_ENV"
+            else
+              echo "PUSH_LATEST=0" >> "$GITHUB_ENV"
+              echo "::notice::${TAG} 不是最新版本 tag（最新为 ${NEWEST}）—— 本次不推进 :latest"
+            fi
+          fi
+
+          docker build \
+            -f deploy/Dockerfile \
+            -t "${IMAGE}:${VERSION}" \
+            -t "${IMAGE}:latest" \
+            -t "${IMAGE}:sha-${SHA}" \
+            .
+
+      # 冒烟放在推送之前：镜像在本地 build 出来就能验，不通过就不推，
+      # GHCR 上永远不会出现坏镜像。
+      - name: 容器冒烟
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          BASE=http://127.0.0.1:18800
+          CID="$(docker run -d --rm -p 18800:8800 "${IMAGE}:${VERSION}")"
+          trap 'echo "--- docker logs ---"; docker logs "$CID" 2>&1 | tail -60; docker rm -f "$CID" >/dev/null 2>&1 || true' EXIT
+
+          ready=0
+          for _ in $(seq 1 30); do
+            if curl -fsS -m 2 "$BASE/healthz" >/dev/null 2>&1; then ready=1; break; fi
+            sleep 1
+          done
+          if [ "$ready" != 1 ]; then echo "::error::30s 内 /healthz 未就绪"; exit 1; fi
+
+          BODY="$(curl -fsS "$BASE/healthz")"
+          echo "GET /healthz -> $BODY"
+          BODY="$BODY" python3 -c 'import json,os;d=json.loads(os.environ["BODY"]);assert d.get("status")=="ok",d'
+
+          # 证明「版本写回真的进了镜像」：否则 <version> tag 与实际内容不符
+          APP_VER="$(curl -fsS "$BASE/openapi.json" \
+            | python3 -c 'import json,sys;print(json.load(sys.stdin)["info"]["version"])')"
+          echo "镜像内自报版本 -> $APP_VER"
+          [ "$APP_VER" = "$VERSION" ] || { echo "::error::镜像版本 $APP_VER != 发布版本 $VERSION"; exit 1; }
+
+          # 鉴权确实接线了（要在 healthz 成功之后探，否则 401 可能只是「还没起来」）
+          CODE="$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/me")"
+          echo "GET /api/me（无 cookie）-> $CODE"
+          [ "$CODE" = 401 ] || { echo "::error::期望 401，实际 $CODE"; exit 1; }
+
+      - name: 登录 GHCR 并推送
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          echo '${{ secrets.GITHUB_TOKEN }}' | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+          docker push "${IMAGE}:${VERSION}"
+          docker push "${IMAGE}:sha-${SHA}"
+          if [ "$PUSH_LATEST" = 1 ]; then
+            docker push "${IMAGE}:latest"
+          fi
+
+      - name: 核验三 tag 指向同一镜像
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          declare -a TAGS=("${VERSION}" "sha-${SHA}")
+          if [ "$PUSH_LATEST" = 1 ]; then TAGS+=("latest"); fi
+
+          declare -a D=()
+          for T in "${TAGS[@]}"; do
+            REF="$(docker inspect --format '{{index .RepoDigests 0}}' "${IMAGE}:${T}" 2>/dev/null || true)"
+            if [ -z "$REF" ]; then
+              # 某些 daemon 在 push 后不填 RepoDigests —— 回落到本地镜像 ID
+              REF="$(docker inspect --format '{{.Id}}' "${IMAGE}:${T}")"
+            fi
+            echo "${T} -> ${REF}"
+            D+=("${REF##*@}")
+          done
+
+          for I in "${D[@]}"; do
+            if [ "$I" != "${D[0]}" ]; then
+              echo "::error::已推送 tag 的 digest 不一致（应来自同一次 build）"
+              exit 1
+            fi
+          done
+          echo "digest=${D[0]}"
+
+  # ------------------------------------------------------------------
+  # 打 tag + 建 Release（镜像已在上一 job 推成功，失败不会留下半成品）
+  # ------------------------------------------------------------------
+  release:
+    needs: [resolve, build-and-push]
+    if: needs.resolve.outputs.mode != 'skip'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: 配置 git 身份
+        run: |
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+      - name: 生成 changelog
+        env:
+          MODE: ${{ needs.resolve.outputs.mode }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          REPO_URL="https://github.com/${{ github.repository }}"
+          SHA="$(git rev-parse --short=7 HEAD)"
+
+          if [ "$MODE" = tag ]; then
+            # TAG^ 把 annotated tag peel 到其父提交，所以不会取到自己
+            if PREV="$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' "${TAG}^" 2>/dev/null)"; then
+              RANGE="${PREV}..${TAG}"
+            else
+              RANGE="${TAG}"      # 首个 release：下面用 --max-count 限长
+            fi
+          else
+            PREV="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)"
+            if [ -n "$PREV" ]; then RANGE="${PREV}..HEAD"; else RANGE="HEAD"; fi
+          fi
+          echo "range=${RANGE}"
+
+          # 不用 gh release create --generate-notes：它依赖已合并的 PR，
+          # 直推 main 的仓库实测只产出一行 compare 链接。
+          {
+            echo "## ${TAG}"
+            echo
+            if [ "$MODE" = auto ] && [ -n "${PREV:-}" ]; then
+              echo "**Full changelog**: ${REPO_URL}/compare/${PREV}...${TAG}"
+              echo
+            fi
+            git log "$RANGE" --no-merges --max-count=50 --pretty='- %s (%h)'
+            echo
+            echo "### 容器镜像"
+            echo
+            echo '```'
+            echo "docker pull ${IMAGE}:${VERSION}"
+            echo '```'
+            echo
+            echo "- \`${IMAGE}:${VERSION}\` / \`${IMAGE}:latest\` / \`${IMAGE}:sha-${SHA}\`"
+          } > NOTES.md
+          cat NOTES.md
+
+      - name: 打 tag 并推送（仅 auto）
+        if: needs.resolve.outputs.mode == 'auto'
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "::error::tag ${TAG} 已存在（并发运行或有人手打了同一版本）—— 中止，不覆盖"
+            exit 1
+          fi
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"
+
+      - name: 建 Release（幂等）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          MODE: ${{ needs.resolve.outputs.mode }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在 —— 跳过创建（重跑幂等）"
+            exit 0
+          fi
+          if [ "$MODE" = tag ]; then
+            # 补发旧 tag 时不要把它标成 Latest
+            gh release create "$TAG" --title "$TAG" --notes-file NOTES.md --latest=false
+          else
+            gh release create "$TAG" --title "$TAG" --notes-file NOTES.md
+          fi
+
+      - name: 汇总
+        env:
+          MODE: ${{ needs.resolve.outputs.mode }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          {
+            echo "### 已发布 ${TAG}（模式：${MODE}）"
+            echo
+            echo "- \`${IMAGE}:${VERSION}\`"
+            echo "- \`${IMAGE}:latest\`"
+            echo "- Release: https://github.com/${{ github.repository }}/releases/tag/${TAG}"
+            echo
+            echo "> 包可见性为人工一次性设置（GITHUB_TOKEN 管不了用户/组织级 package 的可见性）。"
+          } >> "$GITHUB_STEP_SUMMARY"
