@@ -219,8 +219,15 @@ async def main() -> int:
         check("new-api 侧 JIT 账户已创建", e2e_user is not None,
               f"user_id={user_id} username={e2e_user['username'] if e2e_user else '?'}")
 
-        st, _ = jreq("GET", "/v1/models", None, key)
-        check("用户 key 直连 /v1/models（免费端点）", st == 200, f"HTTP {st}")
+        st, d = jreq("GET", "/v1/models", None, key)
+        models = [m.get("id") for m in (d.get("data") or [])] if st == 200 else []
+        # ⚠️ 必须断言**列表非空**：空列表同样返回 200。历史上正因为只断言状态码，
+        #    「用户 group 为空 ⇒ 零模型」这个缺陷从测试环境一路漏到了生产。
+        check(
+            "用户 key 直连 /v1/models（免费端点，且列表非空）",
+            st == 200 and len(models) > 0,
+            f"HTTP {st} models={len(models)}",
+        )
 
         # ---------- AC-04 幂等 ----------
         print("\n■ 重复登录幂等（AC-04）")

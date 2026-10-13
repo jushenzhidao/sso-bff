@@ -14,6 +14,7 @@ from sso_bff.crypto import decrypt, encrypt, mask_key  # noqa: E402
 from sso_bff.jit import derive_password, derive_username  # noqa: E402
 from sso_bff.logging_setup import _mask_message  # noqa: E402
 from sso_bff.oidc import mask_phone  # noqa: E402
+from sso_bff.redirects import safe_redirect  # noqa: E402
 
 
 def test_crypto_roundtrip():
@@ -43,6 +44,42 @@ def test_derive_username_length():
         u = derive_username(sub)
         assert u.startswith("sso_")
         assert len(u) <= 20
+
+
+ALLOW = ["https://appdemo.1task.cn"]
+
+
+def test_safe_redirect_keeps_site_relative_paths():
+    assert safe_redirect("/demo", ALLOW) == "/demo"
+    assert safe_redirect("/console-connect?x=1", ALLOW) == "/console-connect?x=1"
+
+
+def test_safe_redirect_allows_whitelisted_origin():
+    assert safe_redirect("https://appdemo.1task.cn/", ALLOW) == "https://appdemo.1task.cn/"
+    assert safe_redirect("https://appdemo.1task.cn/a/b", ALLOW) == "https://appdemo.1task.cn/a/b"
+
+
+def test_safe_redirect_blocks_open_redirect():
+    # 开放重定向的核心用例：陌生域名必须回落站内
+    for evil in (
+        "https://evil.com",
+        "https://evil.com/path",
+        "http://appdemo.1task.cn",          # scheme 不匹配（白名单是 https）
+        "https://appdemo.1task.cn.evil.com",  # 后缀伪装
+        "https://1task.cn",
+        "//evil.com",                        # 协议相对 URL
+        "//evil.com/x",
+        "javascript:alert(1)",
+        "data:text/html,<script>1</script>",
+        "",
+        None,
+    ):
+        assert safe_redirect(evil, ALLOW) == "/", f"{evil!r} 未被拦截"
+
+
+def test_safe_redirect_without_whitelist_blocks_all_absolute():
+    assert safe_redirect("https://appdemo.1task.cn/", []) == "/"
+    assert safe_redirect("/demo", []) == "/demo"
 
 
 def test_log_redaction_masks_keys_and_jwt():

@@ -52,6 +52,7 @@ class NewApiUser:
     role: int
     quota: int
     used_quota: int
+    group: str = ""
 
 
 def _client() -> httpx.AsyncClient:
@@ -144,11 +145,21 @@ class NewApiClient:
         return await _with_retry(_once)
 
     # ---------------- 用户管理（admin） ----------------
-    async def create_user(self, username: str, password: str, display_name: str) -> int:
-        """建用户，返回 user id。注意：rc.42 不接受 oidc_id 字段（静默丢弃）。
+    async def create_user(
+        self, username: str, password: str, display_name: str, group: str = ""
+    ) -> int:
+        """建用户，返回 user id。
 
-        重复用户名（上次建号后响应丢失的残留）⇒ 直接收养该账户。
+        rc.42 的两处静默丢弃，都踩过：
+          · `oidc_id` —— CreateUser 不接收（绑定只能走 OAuth bind）
+          · `group`   —— CreateUser **同样不接收**（源码 cleanUser 只含
+            Username/Password/DisplayName/Role）⇒ 必须建号后单独 PUT 设置。
+            漏了这一步，用户 group 落成空串，匹配不到任何 ability，
+            表现为 /v1/models 返回空列表、模型调用「无可用渠道」。
+
+        重复用户名（上次建号后响应丢失的残留）⇒ 直接收养该账户（不改其分组）。
         """
+        created = True
         try:
             await self._admin_call(
                 "POST",
@@ -163,12 +174,35 @@ class NewApiClient:
         except NewApiError as e:
             if "Duplicate" not in str(e):
                 raise
+            created = False
             log.info("create_user: %s 已存在（残留收养）", username)
         user = await self.find_user_by_username(username)
         if not user:
             raise NewApiError(f"create_user: user {username!r} not found after creation")
-        log.info("new-api user ready: id=%s username=%s", user.id, username)
+        if created and group:
+            await self.set_user_group(user.id, username, display_name, group)
+        log.info("new-api user ready: id=%s username=%s group=%s", user.id, username,
+                 group if created else "(收养，未改分组)")
         return user.id
+
+    async def set_user_group(
+        self, user_id: int, username: str, display_name: str, group: str
+    ) -> None:
+        """设置用户分组。rc.42 里**只有 PUT /api/user/ 接受 group**（CreateUser 会丢）。
+
+        UpdateUser 要求 username 非空，故一并带上；display_name 也带上以免被清空。
+        分组变更**不触发** X-Security-Proof（只有改口令 / 改管理员权限才要）。
+        """
+        await self._admin_call(
+            "PUT",
+            "/api/user/",
+            json={
+                "id": user_id,
+                "username": username,
+                "display_name": display_name,
+                "group": group,
+            },
+        )
 
     async def find_user_by_username(self, username: str) -> NewApiUser | None:
         data = await self._admin_call(
@@ -184,6 +218,7 @@ class NewApiClient:
                     role=item.get("role", 1),
                     quota=item.get("quota", 0),
                     used_quota=item.get("used_quota", 0),
+                    group=item.get("group", ""),
                 )
         return None
 

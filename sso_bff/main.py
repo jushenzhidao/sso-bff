@@ -35,6 +35,7 @@ from .jit import (
 from .logging_setup import get_logger, setup_logging
 from .newapi import NewApiError
 from .oidc import OIDCUserInfo, mask_phone, oidc
+from .redirects import safe_redirect
 from .sessions import Session, store
 from .tasks import background
 
@@ -161,7 +162,10 @@ async def auth_login(redirect: str = Query(default="/", description="登录完�
     state = secrets.token_urlsafe(24)
     nonce = secrets.token_urlsafe(24)
     verifier, _challenge = oidc.new_pkce()
-    await store.put_state(state, {"nonce": nonce, "verifier": verifier, "redirect": redirect})
+    # 防开放重定向：只接受站内路径或白名单内的绝对 URL（见 redirects.safe_redirect）。
+    # 不校验的话 /auth/login?redirect=https://evil.com 能把刚登录成功的用户弹到任意站点。
+    safe = safe_redirect(redirect, settings.redirect_origins)
+    await store.put_state(state, {"nonce": nonce, "verifier": verifier, "redirect": safe})
     url = await oidc.build_authorize_url(state=state, nonce=nonce, code_verifier=verifier)
     return RedirectResponse(url, status_code=302)
 
@@ -212,7 +216,8 @@ async def auth_callback(
         jit_error = "jit_failed"
         log.error("JIT at callback failed for sub=%s…: %s", session.sub[:8], e)
 
-    redirect_to = payload.get("redirect") or "/"
+    # 纵深防御：state 可能由旧版本写入，或将来有别的入口写它，这里再收敛一次。
+    redirect_to = safe_redirect(payload.get("redirect"), settings.redirect_origins)
     sep = "&" if "?" in redirect_to else "?"
     if jit_error:
         redirect_to += f"{sep}error={jit_error}"

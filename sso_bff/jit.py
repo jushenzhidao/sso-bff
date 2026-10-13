@@ -105,11 +105,24 @@ async def get_or_provision(sub: str, profile: OIDCUserInfo) -> ProvisionResult:
         # 1) 建用户（或回收孤儿）
         user = await newapi.find_user_by_username(username)
         if user is None:
-            user_id = await newapi.create_user(username, password, display_name)
+            user_id = await newapi.create_user(
+                username, password, display_name, group=settings.newapi_default_group
+            )
             log.info("JIT created new-api user id=%s username=%s", user_id, username)
         else:
             user_id = user.id
             log.info("JIT adopting existing new-api user id=%s username=%s", user_id, username)
+            if not user.group:
+                # 空分组是历史遗留的坏状态（匹配不到任何模型）⇒ 补默认分组自愈。
+                # 非空则不动：可能是管理员有意调整（如 vip），不该被发版悄悄覆盖。
+                log.info(
+                    "JIT healing empty group for user id=%s -> %s",
+                    user_id,
+                    settings.newapi_default_group,
+                )
+                await newapi.set_user_group(
+                    user_id, username, user.display_name, settings.newapi_default_group
+                )
 
         # 2) 以该用户身份登录（rc.42：令牌仅本人会话可发）
         user_token = await newapi.login_as_user(username, password)
