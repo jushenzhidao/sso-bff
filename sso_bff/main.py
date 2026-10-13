@@ -157,8 +157,11 @@ async def readyz() -> JSONResponse:
 
 
 # ---------------- F2.1 登录发起与回调 ----------------
-@app.get("/auth/login")
-async def auth_login(redirect: str = Query(default="/", description="登录完成后回跳地址")):
+async def _begin_login(redirect: str) -> str:
+    """生成 state/nonce/PKCE 并落 Redis，返回 Casdoor 授权 URL。
+
+    跳转式与服务式（JSON 返回）共用这一份，避免两条路各写一遍。
+    """
     state = secrets.token_urlsafe(24)
     nonce = secrets.token_urlsafe(24)
     verifier, _challenge = oidc.new_pkce()
@@ -166,8 +169,26 @@ async def auth_login(redirect: str = Query(default="/", description="登录完�
     # 不校验的话 /auth/login?redirect=https://evil.com 能把刚登录成功的用户弹到任意站点。
     safe = safe_redirect(redirect, settings.redirect_origins)
     await store.put_state(state, {"nonce": nonce, "verifier": verifier, "redirect": safe})
-    url = await oidc.build_authorize_url(state=state, nonce=nonce, code_verifier=verifier)
-    return RedirectResponse(url, status_code=302)
+    return await oidc.build_authorize_url(state=state, nonce=nonce, code_verifier=verifier)
+
+
+@app.get("/auth/login")
+async def auth_login(redirect: str = Query(default="/", description="登录完成后回跳地址")):
+    """跳转式登录发起（传统 OIDC 起点）：浏览器会被 302 到 Casdoor。"""
+    return RedirectResponse(await _begin_login(redirect), status_code=302)
+
+
+@app.post("/api/login/start")
+async def api_login_start(redirect: str = Query(default="/", description="登录完成后回跳地址")):
+    """同一件事，但把授权 URL 以 JSON 返回，由前端自己 `location.href` 过去。
+
+    用途：跨域前端（如 appdemo.1task.cn）可**少一次页面跳转** —— 原本是
+    浏览器先导航到本端点再 302 去 Casdoor（两跳），现在改成后台 fetch 一次拿 URL、
+    直接导航去 Casdoor（一跳；fetch 是后台请求，用户看不到跳转）。
+
+    与 `POST /api/console-connect/start` 同一模式（控制台绑定早已这么做）。
+    """
+    return {"authorize_url": await _begin_login(redirect)}
 
 
 @app.get("/auth/callback")
